@@ -40,7 +40,14 @@ import (
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 )
 
-const maxPagedOutBytes int64 = 8 << 30 // 8 GiB eviction threshold for paged-out snapshot memory
+const (
+	// maxPagedOutBytes is the legacy fixed eviction threshold for paged-out
+	// snapshot memory (8 GiB). It remains the effective limit for
+	// prefixCache values constructed without a limit (tests, older call
+	// sites). Production runners get a RAM-scaled budget via newPrefixCache;
+	// see prefix_cache_config.go.
+	maxPagedOutBytes int64 = 8 << 30
+)
 
 type prefixCache struct {
 	root          *trieNode   // root of the prefix trie
@@ -48,9 +55,22 @@ type prefixCache struct {
 	caches        []cache.Cache
 	pagedOutBytes int64 // total bytes in paged-out snapshots across the trie
 
+	// pagedOutLimit caps paged-out snapshot memory. The zero value selects
+	// maxPagedOutBytes (the legacy fixed budget); newPrefixCache installs
+	// the RAM-scaled budget resolved at startup.
+	pagedOutLimit int64
+
 	// draftLookahead is how far the draft caches' entries reference past
 	// their own slot; trie keys pack each token with its look-ahead (see key).
 	draftLookahead int
+}
+
+// pagedOutBudgetLimit returns the effective eviction threshold for this cache.
+func (c *prefixCache) pagedOutBudgetLimit() int64 {
+	if c.pagedOutLimit == 0 {
+		return maxPagedOutBytes
+	}
+	return c.pagedOutLimit
 }
 
 // pendingSnapshot is a snapshot scheduled to be taken during prefill.
@@ -80,7 +100,10 @@ type cacheSession struct {
 
 // newPrefixCache manages the given cache slots for the model's life.
 func newPrefixCache(caches []cache.Cache) *prefixCache {
-	return &prefixCache{caches: caches}
+	return &prefixCache{
+		caches:        caches,
+		pagedOutLimit: pagedOutBudget(),
+	}
 }
 
 func (c *prefixCache) ensureRoot() {
@@ -602,11 +625,12 @@ func (s *cacheSession) close() {
 
 // enforceEvictionPolicy evicts eligible nodes until paged-out memory is within limits.
 func (c *prefixCache) enforceEvictionPolicy() {
-	if c.pagedOutBytes <= maxPagedOutBytes {
+	limit := c.pagedOutBudgetLimit()
+	if c.pagedOutBytes <= limit {
 		return
 	}
 
-	for c.pagedOutBytes > maxPagedOutBytes {
+	for c.pagedOutBytes > limit {
 		// Evicting the frontier's parent merges the frontier into it, so
 		// resolve the frontier again after every eviction.
 		frontier := c.activePath[len(c.activePath)-1]
